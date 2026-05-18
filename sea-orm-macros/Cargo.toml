@@ -38,6 +38,8 @@ sea-orm = { path = "../", default-features = false, features = [
     "macros",
     "tests-cfg",
 ] }
+sea-orm-ractor = { path = "../sea-orm-ractor" }
+ractor = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 
 [features]

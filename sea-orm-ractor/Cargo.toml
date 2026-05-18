@@ -16,11 +16,6 @@ version       = "0.1.0"
 name = "sea_orm_ractor"
 path = "src/lib.rs"
 
-# PP-13 wave-2 fix: present in parent workspace's `exclude` list, so cargo
-# would otherwise refuse to compile this crate standalone. The empty
-# [workspace] table marks this crate as its own workspace root.
-[workspace]
-
 [dependencies]
 # Path dep to the root sea-orm crate; exact pinning deferred to consolidation sprint.
 sea-orm  = { version = "2.0.0-rc", path = "../", default-features = false }
@@ -28,6 +23,3 @@ sea-orm  = { version = "2.0.0-rc", path = "../", default-features = false }
 ractor     = "*"
 once_cell  = "*"
 thiserror  = "*"
-
-# Temporary workspace declaration for standalone cargo check during Sprint 1.
-# The orchestrator will remove this and add sea-orm-ractor to the root workspace.members.

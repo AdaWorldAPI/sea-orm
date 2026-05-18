@@ -47,3 +47,4 @@ serde_yaml = "0.9"
 indoc             = "2.0.6"
 pretty_assertions = { version = "0.7" }
 sea-orm           = { path = "../", default-features = false, features = ["macros"] }
+tempfile          = "3"

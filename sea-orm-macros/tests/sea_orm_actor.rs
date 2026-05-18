@@ -1,0 +1,67 @@
+//! Integration-plan §5 compile-only test for `#[derive(SeaOrmActor)]`.
+//!
+//! This test verifies that:
+//! 1. The `SeaOrmActor` derive macro expands cleanly for a well-formed `Model`.
+//! 2. The generated `EntityActor` impl is reachable as `Entity::actor(pk)`.
+//! 3. The return type of `Entity::actor` is `ractor::ActorRef<TestMsg>`.
+//!
+//! **Compile-only**: `Entity::actor()` panics at runtime (`unimplemented!` — Sprint 2
+//! will add the real spawn body).  The test function therefore only checks the
+//! function-item type without calling it.
+
+/// A minimal sea-orm entity module used to exercise the derive macro.
+///
+/// Mirrors the "Ticket" example in integration-plan §5.
+mod ticket {
+    use sea_orm::entity::prelude::*;
+
+    /// The message enum for the Ticket actor.
+    ///
+    /// Implements `ractor::Message` via the blanket impl
+    /// `impl<T: Any + Send + Sized + 'static> Message for T`.
+    #[derive(Debug)]
+    pub enum TestMsg {
+        /// Assign the ticket to a user (by user-id).
+        Assign(i64),
+        /// Mark the ticket resolved.
+        Resolve,
+        /// Escalate the ticket.
+        Escalate,
+    }
+
+    /// The `Model` struct.  `DeriveEntityModel` generates `Entity`, `Column`,
+    /// `PrimaryKey`, `Relation`, `ActiveModel`.  `SeaOrmActor` generates the
+    /// `EntityActor` impl for `super::Entity` (i.e. `ticket::Entity` from the
+    /// test's perspective).
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, sea_orm_macros::SeaOrmActor)]
+    #[sea_orm(table_name = "ticket")]
+    #[actor(msg = "TestMsg")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub status: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// Verify the generated `Entity::actor` has the correct type signature.
+///
+/// We capture the function-item as a typed `fn` pointer.  If the derive emits
+/// the wrong type for `ActorMsg` or `ActorPrimaryKey`, this line fails to
+/// compile — which is the whole point of the test.
+///
+/// We do **not** call the function because the spawn closure body is
+/// `unimplemented!` until Sprint 2.
+#[test]
+fn sea_orm_actor_derive_type_checks() {
+    // Capture `Entity::actor` as a typed function pointer.
+    // Compile error here means the derive generated an incorrect type.
+    let _actor_fn: fn(i64) -> ::ractor::ActorRef<ticket::TestMsg> = ticket::Entity::actor;
+
+    // Suppress "unused variable" lint — this is a compile-only test.
+    let _ = _actor_fn;
+}
