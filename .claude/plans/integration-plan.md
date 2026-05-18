@@ -24,7 +24,48 @@ Four glue crates close the gap:
 | 3 | `sea-orm-ractor` | **this repo** | `Entity::PK` → ractor process registry |
 | 4 | `cognitive-shader-actor` | lance-graph | cognitive shaders → `ractor::Actor` adapter |
 
-This repo owns **#3** plus the **ontology-driven entity codegen** + the **`stream_arrow()` surface** for analytic results.
+This repo owns **#3** plus the **ontology-driven entity codegen** + the **`stream_arrow()` extension trait** for analytic results.
+
+### Integration principle: additive contract shape
+
+**All work in this plan is additive.** No existing trait signature changes. No existing module moves. No existing file deletes. New capabilities ship as **new traits** (`EntityActor`), **new extension traits** (`SelectArrowExt`), **new derive macros** (`SeaOrmActor`), or **new CLI flags** (`--from-ontology`). The existing surface today's consumers depend on stays exactly as-is.
+
+**Contract crates are the integration surface.** sea-orm's role in this discipline is the **extension-trait pattern**: don't add methods to `Select<E>`, add a `SelectArrowExt` trait that's blanket-implemented for `Select<E>`. Consumers opt in via `use sea_orm_arrow::SelectArrowExt`. Non-importers see no change.
+
+### Contracts (existing + new)
+
+| Contract | Owner repo | Status today | This plan adds |
+|---|---|---|---|
+| `lance-graph-contract` | lance-graph | 0.1.x | 0.2.0 with new IR submodule (additive); no impact on sea-orm |
+| `KVKey` / `Datastore` (surrealdb) | surrealdb | stable | new `CfStream` / `MvccSource` traits (additive); no impact on sea-orm |
+| `EntityTrait` / `ColumnTrait` / `Select<E>` / `QueryAs` | **this repo** | 2.0 | **unchanged** — new trait `EntityActor` + new extension trait `SelectArrowExt` + new derive `SeaOrmActor` |
+| `ndarray::hpc::*` | ndarray | 0.17 fork | unchanged |
+
+**New surfaces this repo adds** (all opt-in):
+
+```rust
+// sea-orm-ractor/src/lib.rs                    — NEW crate
+/// Extends EntityTrait. Implementors get a per-PK actor registry.
+pub trait EntityActor: sea_orm::EntityTrait {
+    type ActorMsg: ractor::Message + 'static;
+    type PrimaryKey: Eq + std::hash::Hash + Clone + Send + Sync + 'static;
+    fn actor(pk: Self::PrimaryKey) -> ractor::ActorRef<Self::ActorMsg>;
+}
+
+// sea-orm-arrow/src/stream.rs                  — NEW module in existing crate
+/// Extension trait — blanket-impl'd for Select<E> and QueryAs.
+/// Existing Select<E> / QueryAs surfaces are UNCHANGED. Consumers opt in via `use`.
+pub trait SelectArrowExt {
+    fn stream_arrow(self, db: &sea_orm::DatabaseConnection)
+        -> impl futures::Stream<Item = Result<arrow_array::RecordBatch, sea_orm::DbErr>>;
+}
+
+// sea-orm-macros                                — NEW derive added; existing derives unchanged
+#[proc_macro_derive(SeaOrmActor, attributes(actor))]
+pub fn derive_sea_orm_actor(input: TokenStream) -> TokenStream { /* ... */ }
+```
+
+**Per-repo enforcement**: every Sprint item below is read as "add this; don't change what's there."
 
 ---
 
@@ -68,11 +109,13 @@ This repo owns **#3** plus the **ontology-driven entity codegen** + the **`strea
 
 This repo is **the consumer-facing API**. Consumers don't pick engines — sea-orm 2.0's typed entities + the federated planner do that. The contract sea-orm provides:
 
-1. **Compile-time typed access** — `#[sea_orm::model]` + strongly-typed `COLUMN` constants make queries checked at build time. This is what `CLAUDE.md` describes as the SeaORM 2.0 walk-through.
-2. **Arrow surfacing** — `sea-orm-arrow 2.0.0-rc.4` (Arrow 58) exposes results as `RecordBatch` directly. Zero-copy from Lance / DataFusion.
-3. **Entity loader for relations** — `Entity::load().filter_by_*().with(...)` for nested fetches without N+1.
-4. **Schema registry** — `db.get_schema_registry("crate::*").sync(db)` for entity-first deploys.
-5. **Dispatch tags via `Entity::PK`** — glue #3 binds the PK to a ractor process registry.
+1. **Compile-time typed access** — `#[sea_orm::model]` + strongly-typed `COLUMN` constants make queries checked at build time (per `CLAUDE.md`)
+2. **Arrow surfacing** — `sea-orm-arrow` 2.0.0-rc.4 exposes results as `RecordBatch` (extension trait `SelectArrowExt`)
+3. **Entity loader for relations** — `Entity::load().filter_by_*().with(...)` for nested fetches without N+1
+4. **Schema registry** — `db.get_schema_registry("crate::*").sync(db)` for entity-first deploys
+5. **Dispatch tags via `Entity::PK`** — glue #3 binds the PK to a ractor process registry via the new `EntityActor` trait
+
+Every one of (1)–(4) stays exactly as it is. (5) is the new opt-in surface.
 
 ---
 
@@ -82,19 +125,19 @@ This repo is **the consumer-facing API**. Consumers don't pick engines — sea-o
 Core ORM. **Stable surface** for the integration — no breaking changes planned.
 
 ### `sea-orm-arrow/`
-Arrow integration (`Cargo.toml`: version 2.0.0-rc.4, Arrow 58). **The zero-copy bridge.** Needs a `stream_arrow()` method on `Select<E>` and `QueryAs` for analytic queries (see §6). Arrow 58 vs lance 57 mismatch resolved at the planner boundary (upcast).
+Arrow integration. Today 2.0.0-rc.4 / Arrow 58. **The zero-copy bridge.** Gets a NEW module `sea-orm-arrow/src/stream.rs` defining `SelectArrowExt`; existing `sea-orm-arrow` surface is unchanged.
 
 ### `sea-orm-macros/`
-Derive macros. **Glue #3 lives here** as a new `#[derive(SeaOrmActor)]` macro that emits the ractor process registry binding (see §5).
+Derive macros. Adds NEW `#[derive(SeaOrmActor)]`; existing derives unchanged.
 
 ### `sea-orm-codegen/`
-CLI codegen for entities. **Plan**: add `--from-ontology` mode that reads `lance-graph-catalog` YAML and emits entities (see §7).
+CLI codegen. Adds NEW `--from-ontology` mode that reads `lance-graph-catalog` YAML and emits entities (§7). Existing flags unchanged.
 
 ### `sea-orm-cli/`
-CLI front-end. Exposes `sea-orm-cli generate entity --from-ontology schema.yml`.
+Exposes the new `--from-ontology` flag on the existing `generate entity` subcommand. No existing flags changed.
 
 ### `sea-orm-sync/`
-Schema sync. **Stable** — used by the entity-first workflow which the ontology codegen feeds into.
+Stable. Entity-first workflow which the ontology codegen feeds into.
 
 ---
 
@@ -102,7 +145,9 @@ Schema sync. **Stable** — used by the entity-first workflow which the ontology
 
 **Goal**: every entity gets a ractor process registry binding tied to its primary key. Sending a message to "the actor that manages this entity" is a method call on the entity type.
 
-**Why**: this is the **dispatch-tag mechanism**. The "outbound address being a dynamic tag passed implicitly via sea-orm" from the architecture discussion — given an entity PK, route a message to the actor that owns it. Removes addressing concerns from consumer code.
+**Why**: the **dispatch-tag mechanism**. The "outbound address being a dynamic tag passed implicitly via sea-orm" — given an entity PK, route a message to the actor that owns it. Removes addressing concerns from consumer code.
+
+**Additive shape**: NEW top-level crate `sea-orm-ractor/` + a NEW derive in `sea-orm-macros/`. The new `EntityActor` trait extends `EntityTrait` — it doesn't modify it. Entities that don't `#[derive(SeaOrmActor)]` are unaffected.
 
 **Crate location**: new top-level crate `sea-orm-ractor/` + derive extension in `sea-orm-macros/`.
 
@@ -113,7 +158,7 @@ Schema sync. **Stable** — used by the entity-first workflow which the ontology
 use ractor::{Actor, ActorRef};
 use sea_orm::EntityTrait;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 /// A typed actor registry keyed on an entity's primary key.
 pub struct EntityActorRegistry<E: EntityActor> {
@@ -132,12 +177,11 @@ impl<E: EntityActor> EntityActorRegistry<E> {
     }
 }
 
-/// Every entity gets a registry via the `SeaOrmActor` derive.
+/// NEW trait. Extends EntityTrait; doesn't replace it.
+/// Only entities with `#[derive(SeaOrmActor)]` implement this.
 pub trait EntityActor: EntityTrait {
     type ActorMsg: ractor::Message + 'static;
     type PrimaryKey: Eq + std::hash::Hash + Clone + Send + Sync + 'static;
-
-    /// Get (or lazily spawn) the actor managing this PK.
     fn actor(pk: Self::PrimaryKey) -> ActorRef<Self::ActorMsg>;
 }
 ```
@@ -147,7 +191,7 @@ pub trait EntityActor: EntityTrait {
 In `sea-orm-macros`:
 
 ```rust
-// sea-orm-macros — new derive
+// sea-orm-macros — NEW derive; existing derives unchanged
 
 #[proc_macro_derive(SeaOrmActor, attributes(actor))]
 pub fn derive_sea_orm_actor(input: TokenStream) -> TokenStream {
@@ -197,6 +241,8 @@ let actor = ticket::Entity::actor(4711);
 actor.send_message(ticket::TicketMsg::Assign(user_id))?;
 ```
 
+Entities without `#[derive(SeaOrmActor)]` continue to work unchanged. The trait is opt-in.
+
 ### Combined with surrealdb-ractor (glue #1)
 
 The Hiro-ticket-system replacement in three lines:
@@ -216,47 +262,67 @@ while let Some(delta) = deltas.next().await {
 }
 ```
 
-Live subscription + typed PK → actor dispatch. No polling, no addressing logic.
-
 ---
 
-## 6. Arrow surfacing for analytic queries — `stream_arrow()`
+## 6. Arrow surfacing — `stream_arrow()` via `SelectArrowExt`
 
 **Goal**: when the federated planner routes an analytic query through lance-graph / DataFusion, the consumer gets the result as Arrow `RecordBatch` directly — no row-by-row materialisation.
 
 **Why**: this is how DataFusion's per-row overhead becomes a non-event. The consumer was going to consume Arrow anyway (for tensors / dataframes / model inputs); making it the native return type means the slow path never runs.
 
-**Already there**: `sea-orm-arrow/src/` has the column ↔ Arrow type mapping.
+**Additive shape**: **extension trait pattern**. `SelectArrowExt` is a NEW trait blanket-implemented for `Select<E>` and `QueryAs`. Consumers opt in by `use sea_orm_arrow::SelectArrowExt`. The existing `Select<E>` / `QueryAs` surfaces are unchanged.
 
-**Gap**: a `stream_arrow()` method on `Select<E>` and `QueryAs` that bypasses ActiveModel materialisation.
-
-### API sketch
+### API sketch (the additive way)
 
 ```rust
-// sea-orm-arrow/src/stream.rs — new module
+// sea-orm-arrow/src/stream.rs — NEW module in existing crate
 use arrow_array::RecordBatch;
 use futures::Stream;
-use sea_orm::{DatabaseConnection, DbErr, EntityTrait, Select};
+use sea_orm::{DatabaseConnection, DbErr, EntityTrait, Select, QueryAs};
+
+/// Extension trait. Importing this in a consumer enables `select.stream_arrow(&db)`.
+/// Existing `Select<E>` surface is UNCHANGED. Non-importers see no API change.
+pub trait SelectArrowExt {
+    fn stream_arrow(self, db: &DatabaseConnection)
+        -> impl Stream<Item = Result<RecordBatch, DbErr>> + Send;
+}
 
 impl<E: EntityTrait> SelectArrowExt for Select<E> {
-    /// Stream results as Arrow RecordBatch instead of model rows.
-    /// Returns a stream of batches sized per the connection's chunk hint.
-    ///
-    /// Uses column metadata from EntityTrait to build the Arrow schema,
-    /// then materialises rows column-by-column instead of row-by-row.
     fn stream_arrow(self, db: &DatabaseConnection)
-        -> impl Stream<Item = Result<RecordBatch, DbErr>>;
+        -> impl Stream<Item = Result<RecordBatch, DbErr>> + Send
+    {
+        // Uses column metadata from EntityTrait to build the Arrow schema,
+        // then materialises rows column-by-column.
+        materialise_arrow_columnar::<E>(self, db)
+    }
 }
+
+// blanket impl for QueryAs too...
 ```
+
+### Why this matters for additive-ness
+
+If we added `stream_arrow()` as an inherent method on `Select<E>`:
+- `Select<E>` changes
+- Any downstream `impl<E> Select<E>` or trait bound naming `Select<E>` could become incompatible
+- The break would be invisible until consumers tried to compile
+
+With the extension trait pattern:
+- `Select<E>` itself stays exactly the same
+- The new capability is gated by `use sea_orm_arrow::SelectArrowExt`
+- Non-importers see literally no change
+- The blanket impl works for every `E: EntityTrait` for free
+
+This is the canonical Rust idiom for additive method extension.
 
 ### Federation hookup
 
 The planner (in surrealdb-core) can decide:
-- PK lookup → goes through KV (sea-orm row return)
-- Range / aggregate on indexed column → KV with batch read (sea-orm Arrow batch return)
-- Cross-table aggregate → lance-graph / DataFusion (sea-orm Arrow streaming return)
-- Cypher / graph traversal → lance-graph (sea-orm Arrow streaming return)
-- Vector ANN → lance-index (sea-orm Arrow streaming return + score column)
+- PK lookup → KV (sea-orm row return, no Arrow)
+- Range / aggregate on indexed column → KV with batch read (Arrow batch return via `stream_arrow`)
+- Cross-table aggregate → lance-graph / DataFusion (Arrow streaming return)
+- Cypher / graph traversal → lance-graph (Arrow streaming return)
+- Vector ANN → lance-index (Arrow streaming return + score column)
 
 From the consumer's perspective, this is one API. The planner picks.
 
@@ -266,7 +332,9 @@ From the consumer's perspective, this is one API. The planner picks.
 
 **Goal**: `lance-graph-catalog` is the single source of truth for schemas; sea-orm entities are generated from it.
 
-**Why**: prevents schema drift across the three engines (surrealdb DEFINE, sea-orm Entity, lance-graph NodeShape/EdgeShape).
+**Why**: prevents schema drift across the three engines.
+
+**Additive shape**: NEW `--from-ontology` flag added to the existing `sea-orm-cli generate entity` subcommand. Existing flags / behaviour unchanged.
 
 ### CLI
 
@@ -274,13 +342,13 @@ From the consumer's perspective, this is one API. The planner picks.
 sea-orm-cli generate entity --from-ontology schema.yml --output ./src/entities/
 ```
 
-### Input (single source — shared with lance-graph & surrealdb)
+### Input (shared with lance-graph & surrealdb)
 
 ```yaml
 nodes:
   Ticket:
     pk: id
-    actor: true                # opts into SeaOrmActor derive
+    actor: true                # opts the entity into SeaOrmActor derive
     columns:
       id: UInt64
       status: { type: String, enum: [Open, Assigned, Resolved, Escalated] }
@@ -327,6 +395,8 @@ pub enum TicketMsg {
 impl ActiveModelBehavior for ActiveModel {}
 ```
 
+Entities WITHOUT `actor: true` in the YAML get the existing entity codegen output exactly as today — no `SeaOrmActor` derive, no `TicketMsg` enum. Backward-compatible by construction.
+
 ### Round-trip property test
 
 ```rust
@@ -339,47 +409,52 @@ fn ontology_round_trip() {
 }
 ```
 
-Guards the bidirectional invariant: editing entities and editing the ontology converge.
-
 ---
 
 ## 8. Sprint sequence (this repo)
+
+All sprints are **additive** — nothing existing changes signature, nothing existing moves, nothing existing is deleted.
 
 ### Sprint 0 — Arrow version reconciliation (3 days)
 - Confirm Arrow 58 alignment
 - Document the version matrix in `sea-orm-arrow/README.md`: sea-orm-arrow 58, lance 57; upcast at planner boundary
 
 ### Sprint 1 — `sea-orm-ractor` MVP (2 weeks)
-- New crate at `sea-orm-ractor/`
-- `SeaOrmActor` derive in `sea-orm-macros`
+- NEW crate at `sea-orm-ractor/`
+- NEW `SeaOrmActor` derive in `sea-orm-macros` (existing derives untouched)
 - `EntityActorRegistry` runtime
-- E2E test: `Ticket` entity, `Entity::actor(pk)` dispatch, mailbox lifecycle
+- E2E test: `Ticket` entity with derive, dispatch via `Entity::actor(pk)`, mailbox lifecycle
+- Entities without the derive remain unchanged and compile clean
 
-### Sprint 2 — `stream_arrow()` (1 week)
-- Add method to `Select<E>` and `QueryAs`
+### Sprint 2 — `SelectArrowExt` extension trait (1 week)
+- NEW module `sea-orm-arrow/src/stream.rs`
+- NEW trait `SelectArrowExt` with blanket impls for `Select<E>` and `QueryAs`
+- `Select<E>` / `QueryAs` themselves untouched
 - Benchmark vs row materialisation on 1M-row table
-- Document in `sea-orm-arrow` README
+- Doc the import idiom in `sea-orm-arrow/README.md`
 
 ### Sprint 3 — `--from-ontology` codegen (2 weeks)
-- Read lance-graph-catalog YAML
+- NEW CLI flag on existing `generate entity` subcommand
+- Read lance-graph-catalog YAML (uses `lance-graph-catalog::to_sea_orm_entity()` — lance-graph plan §7 Sprint 3)
 - Emit entity files with optional `SeaOrmActor` opt-in
 - Round-trip property test
-- Integrate with `sea-orm-cli generate entity`
+- Existing entity codegen output unchanged for ontologies without `actor: true`
 
 ### Sprint 4 — federation E2E (2 weeks)
-- Consumer crate using sea-orm-arrow against a federated planner across all three engines
+- Consumer crate using `SelectArrowExt::stream_arrow` against a federated planner across all three engines
 - Sample app: tiny CRM-like with tickets + users + activity timeline
 
 ---
 
 ## 9. Examples
 
-### Example 1 — Compile-time typed query, zero-copy Arrow result
+### Example 1 — Compile-time typed query, zero-copy Arrow result (via extension trait)
 
 ```rust
 use sea_orm::entity::prelude::*;
 use sea_orm::ExprTrait;
-use sea_orm_arrow::SelectArrowExt;
+use sea_orm_arrow::SelectArrowExt;     // opt-in: enables .stream_arrow()
+use futures::StreamExt;
 
 let db: DatabaseConnection = /* ... */;
 
@@ -389,11 +464,12 @@ let mut stream = ticket::Entity::find()
     .stream_arrow(&db);
 
 while let Some(batch) = stream.next().await {
-    let batch: RecordBatch = batch?;
-    // Hand the Arrow batch directly to a tensor library or dataframe.
+    let batch: arrow_array::RecordBatch = batch?;
     process_columnar(&batch);
 }
 ```
+
+Callers who don't `use SelectArrowExt` still get the existing `find()` / `all()` / `one()` API exactly as before.
 
 ### Example 2 — Live query + entity-actor dispatch
 
@@ -418,19 +494,10 @@ while let Some(d) = deltas.next().await {
 ### Example 3 — Entity-first, ontology-driven deploy
 
 ```bash
-# Single source of truth
 edit schema.yml
-
-# Generate sea-orm entities
 sea-orm-cli generate entity --from-ontology schema.yml --output ./src/entities/
-
-# Generate surrealdb DEFINE statements
 surrealdb-cli generate define --from-ontology schema.yml > deploy/schema.surql
-
-# Apply to running surrealdb
 surreal import --conn ws://surrealdb:8000 deploy/schema.surql
-
-# Build the consumer crate
 cargo build
 ```
 
@@ -439,27 +506,27 @@ One file edited; three engines stay in sync.
 ### Example 4 — Federated query routed by the planner
 
 ```rust
-// Consumer code: doesn't know which engine runs which operator.
+use sea_orm_arrow::SelectArrowExt;
+
 let results = ticket::Entity::find()
     .filter(ticket::COLUMN.status.eq("Open"))
-    // .knows() generates a graph traversal — planner routes to lance-graph.
     .related_via_graph(user::Entity, "REPORTS_TO", max_hops = 3)
-    // Aggregate routes to DataFusion.
     .aggregate(ticket::COLUMN.priority.avg())
     .stream_arrow(&db);
-
-// Single API, three engines underneath, Arrow result, compile-time-typed entity.
 ```
+
+Single API, three engines underneath, Arrow result, compile-time-typed entity — all via the additive extension trait.
 
 ---
 
 ## 10. Open questions
 
 1. **`EntityActorRegistry` scope** — process-local for now (single-node ractor); distributed becomes v2.
-2. **Composite primary keys** — derive macro tuples them; `Entity::actor((a, b))` is the API. Slightly less ergonomic, accepted.
-3. **Actor lifecycle** — lazy spawn on first message; idle-timeout shutdown via supervisor. The supervisor lives in the consumer crate, not in sea-orm-ractor — sea-orm-ractor only provides the registry, not the supervision tree.
-4. **Arrow 57 vs 58** — currently sea-orm-arrow is on 58 and surrealdb-core on 57. Planner upcasts at the boundary; revisit if surrealdb-core moves to 58.
-5. **`stream_arrow` for write-side** — not yet planned. Writes via ActiveModel stay row-oriented (they're transactional). Open to revisit if bulk-load workloads appear.
+2. **Composite primary keys** — derive macro tuples them; `Entity::actor((a, b))` is the API.
+3. **Actor lifecycle** — lazy spawn on first message; idle-timeout shutdown via supervisor (which lives in the consumer crate, not in sea-orm-ractor).
+4. **Arrow 57 vs 58** — sea-orm-arrow on 58 and surrealdb-core on 57. Planner upcasts at the boundary.
+5. **Write-side `stream_arrow`** — not planned. Writes via ActiveModel stay row-oriented (they're transactional).
+6. **Extension trait visibility** — ensure `SelectArrowExt` is re-exported from a stable path (`sea_orm_arrow::SelectArrowExt`) so consumers have a single import.
 
 ---
 
@@ -469,4 +536,5 @@ let results = ticket::Entity::find()
 - **Glue #2** (TiKV TableProvider): `AdaWorldAPI/lance-graph:.claude/plans/integration-plan.md` §5
 - **Glue #4** (cognitive shader actor): `AdaWorldAPI/lance-graph:.claude/plans/integration-plan.md` §6
 - **SIMD kernels**: `AdaWorldAPI/ndarray:.claude/plans/integration-plan.md`
-- **Catalog format** (source of truth for entity codegen): `AdaWorldAPI/lance-graph:.claude/plans/integration-plan.md` §4 + §7 Sprint 3
+- **Catalog `to_sea_orm_entity()` method** (source of truth for our codegen): `AdaWorldAPI/lance-graph:.claude/plans/integration-plan.md` §4 + §7 Sprint 3
+- **`lance-projection` additive sibling** (rather than kv-lance demotion): `AdaWorldAPI/surrealdb:.claude/plans/integration-plan.md` §6
