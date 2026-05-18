@@ -321,6 +321,14 @@ pub async fn run_generate_command(
                 .into());
             }
         }
+        GenerateSubcommands::FromOntology {
+            yaml_path,
+            output_dir,
+        } => {
+            super::generate_from_ontology::run(yaml_path, output_dir)
+                .await
+                .map_err(|e| -> Box<dyn Error> { e.into() })?;
+        }
     }
 
     Ok(())

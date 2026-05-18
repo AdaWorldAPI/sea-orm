@@ -66,13 +66,10 @@ use std::path::PathBuf;
 /// # Sprint 3 stub
 ///
 /// The body is `unimplemented!`. This function will be implemented in Sprint 4.
-pub async fn run(
-    _yaml_path: PathBuf,
-    _output_dir: PathBuf,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Orchestrator follow-up: replace the return type with `anyhow::Result<()>`
-    // once `anyhow` is added to sea-orm-cli/Cargo.toml, then wire in:
+pub async fn run(_yaml_path: PathBuf, _output_dir: PathBuf) -> anyhow::Result<()> {
+    // Sprint 4 implementation stub.
     //
+    // When implementing, wire in:
     //   let input = sea_orm_codegen::from_ontology::parse_yaml(&_yaml_path)?;
     //   let entities = sea_orm_codegen::from_ontology::generate_entities(&input);
     //   std::fs::create_dir_all(&_output_dir)?;

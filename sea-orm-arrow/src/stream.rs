@@ -23,6 +23,20 @@
 //! trait in a separate crate avoids both problems: the new methods are invisible unless
 //! the caller explicitly `use sea_orm_arrow::SelectArrowExt`.
 //!
+//! # Circular-dependency resolution
+//!
+//! `sea-orm` already depends on `sea-orm-arrow` (for the `with-arrow` feature).
+//! Adding `sea-orm` as a dependency of `sea-orm-arrow` in return would create a
+//! compile-time cycle: `sea-orm → sea-orm-arrow → sea-orm` (confirmed empirically —
+//! cargo reports "cyclic package dependency").
+//!
+//! The solution is the **arrow-only trait** shape: `SelectArrowExt` is defined
+//! entirely in terms of Arrow and `futures::Stream` types, with no `sea_orm::*`
+//! in the trait definition at all. The concrete blanket impls for `Select<E>` and
+//! `SelectorRaw<S>` live in `sea-orm` itself (future Sprint 2 wiring), where all
+//! three types (`Select`, `SelectorRaw`, `DatabaseConnection`) are in scope without
+//! any circular reference.
+//!
 //! # Contracts (Plan §1 reference)
 //!
 //! | Layer              | Guarantee                                          |
@@ -33,21 +47,35 @@
 //!
 //! # Sprint note
 //!
-//! Method bodies are stubbed (`unimplemented!`) for Sprint 1 scaffolding. Sprint 2 will
-//! provide the real implementation (row-by-row conversion via
-//! [`crate::arrow_array_to_value`] and batch assembly).
+//! The trait surface (method signatures) is defined here. Sprint 2 will add
+//! the blanket impls for `Select<E>` and `SelectorRaw<S>` in the `sea-orm`
+//! crate itself (or in a bridging module gated by the `with-arrow` feature),
+//! where `DatabaseConnection` and `DbErr` are available without a circular dep.
 //!
-//! # Orchestrator checklist
+//! # Downstream consumer pattern
 //!
-//! * Add `pub mod stream;` to `sea-orm-arrow/src/lib.rs`.
-//! * Add `futures = { version = "0.3", default-features = false, features = ["std"] }`
-//!   to `sea-orm-arrow/Cargo.toml` (the `futures::Stream` trait bound requires it; the
-//!   crate is not currently in `sea-orm-arrow`'s dependency tree).
-//! * Add `sea-orm = { path = "..", default-features = false }` (or an appropriate version
-//!   specifier) to `sea-orm-arrow/Cargo.toml` so the `sea_orm::DatabaseConnection` and
-//!   `sea_orm::DbErr` types resolve.
+//! A downstream crate (or `sea-orm` itself) that depends on **both** `sea-orm`
+//! and `sea-orm-arrow` can provide the blanket impl:
+//!
+//! ```rust,ignore
+//! // In sea-orm/src/arrow_stream.rs (gated by `with-arrow` feature)
+//! use sea_orm_arrow::stream::SelectArrowExt;
+//! use arrow::record_batch::RecordBatch;
+//! use futures::Stream;
+//!
+//! impl<E: sea_orm::EntityTrait> SelectArrowExt for sea_orm::Select<E> {
+//!     type Error = sea_orm::DbErr;
+//!     fn stream_arrow<'a>(
+//!         self,
+//!         db: &'a sea_orm::DatabaseConnection,
+//!     ) -> impl Stream<Item = Result<RecordBatch, Self::Error>> + Send + 'a {
+//!         // … implementation …
+//!     }
+//! }
+//! ```
 
 use arrow::record_batch::RecordBatch;
+use futures::Stream;
 
 // ---------------------------------------------------------------------------
 // Public extension trait
@@ -56,8 +84,22 @@ use arrow::record_batch::RecordBatch;
 /// Extension trait that adds [`stream_arrow`][SelectArrowExt::stream_arrow] to
 /// SeaORM query builders.
 ///
-/// Import this trait to enable Arrow streaming on any [`sea_orm::Select<E>`] or
-/// [`sea_orm::SelectorRaw<S>`] value:
+/// # Design — arrow-only trait surface
+///
+/// This trait is intentionally defined **without any `sea_orm::*` types** in its
+/// signature. This avoids the circular-dependency problem that arises when
+/// `sea-orm-arrow` (which is itself depended on by `sea-orm` via the `with-arrow`
+/// feature) would need to import `sea-orm` types:
+///
+/// - `sea-orm` → `sea-orm-arrow` (existing `with-arrow` feature dep)
+/// - `sea-orm-arrow` → `sea-orm` would create a cycle
+///
+/// Instead, the trait is parameterised over an associated `Db` type (the connection)
+/// and an associated `Error` type, allowing the blanket impls for `Select<E>` and
+/// `SelectorRaw<S>` to live in `sea-orm` itself (Sprint 2), where all types are
+/// available without a circular reference.
+///
+/// Import this trait to enable Arrow streaming on any type that implements it:
 ///
 /// ```rust,ignore
 /// use sea_orm_arrow::SelectArrowExt;
@@ -69,17 +111,25 @@ use arrow::record_batch::RecordBatch;
 /// }
 /// ```
 ///
-/// # Design
+/// # Dyn-compatibility note
 ///
-/// The trait is generic over the query builder (`Self`) so that blanket impls can cover
-/// multiple concrete types without modifying them. Because `impl Trait` return types are
-/// not (yet) object-safe, `stream_arrow` returns an `impl futures::Stream` rather than a
-/// `Box<dyn Stream>`. This means `SelectArrowExt` itself is not dyn-compatible, which is
-/// expected and correct for an extension trait of this kind (see the compile-time test
-/// below).
+/// Because `stream_arrow` returns `impl Stream` (an opaque future), this trait is
+/// intentionally **not** dyn-compatible. That is correct and expected for an
+/// extension trait of this kind.
 ///
 /// See plan §6 and plan §1 Contracts table for rationale.
 pub trait SelectArrowExt {
+    /// The database connection type (e.g. `sea_orm::DatabaseConnection`).
+    ///
+    /// Kept as an associated type so the trait definition is free of any
+    /// `sea_orm::*` imports, preventing a circular dependency.
+    type Db: ?Sized;
+
+    /// The error type yielded by the stream (e.g. `sea_orm::DbErr`).
+    ///
+    /// Kept as an associated type for the same reason as `Db`.
+    type Error;
+
     /// Stream query results as Arrow [`RecordBatch`]es.
     ///
     /// Each batch contains a configurable number of rows (batch size TBD in Sprint 2).
@@ -89,7 +139,7 @@ pub trait SelectArrowExt {
     ///
     /// # Errors
     ///
-    /// Yields [`sea_orm::DbErr`] on database errors or Arrow conversion failures.
+    /// Yields `Self::Error` on database errors or Arrow conversion failures.
     ///
     /// # Example (Plan §6 Example 1)
     ///
@@ -100,49 +150,8 @@ pub trait SelectArrowExt {
     /// ```
     fn stream_arrow(
         self,
-        db: &sea_orm::DatabaseConnection,
-    ) -> impl futures::Stream<Item = Result<RecordBatch, sea_orm::DbErr>> + Send;
-}
-
-// ---------------------------------------------------------------------------
-// Blanket impl for Select<E: EntityTrait>
-// ---------------------------------------------------------------------------
-
-impl<E> SelectArrowExt for sea_orm::Select<E>
-where
-    E: sea_orm::EntityTrait,
-{
-    fn stream_arrow(
-        self,
-        _db: &sea_orm::DatabaseConnection,
-    ) -> impl futures::Stream<Item = Result<RecordBatch, sea_orm::DbErr>> + Send {
-        // Sprint 2 will implement: execute query, iterate rows, convert each
-        // Value via crate::arrow_array_to_value, assemble RecordBatches.
-        #[allow(unreachable_code)]
-        futures::stream::once(async {
-            unimplemented!("SO-2 stub — Sprint 2")
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Blanket impl for SelectorRaw<S> (covers QueryAs / into_model results)
-// ---------------------------------------------------------------------------
-
-impl<S> SelectArrowExt for sea_orm::SelectorRaw<S>
-where
-    S: sea_orm::SelectorTrait + Send,
-{
-    fn stream_arrow(
-        self,
-        _db: &sea_orm::DatabaseConnection,
-    ) -> impl futures::Stream<Item = Result<RecordBatch, sea_orm::DbErr>> + Send {
-        // Sprint 2 will implement the body.
-        #[allow(unreachable_code)]
-        futures::stream::once(async {
-            unimplemented!("SO-2 stub — Sprint 2")
-        })
-    }
+        db: &Self::Db,
+    ) -> impl Stream<Item = Result<RecordBatch, Self::Error>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,29 +160,27 @@ where
 
 #[cfg(test)]
 mod tests {
-    /// Verify that `SelectArrowExt` follows the extension-trait idiom:
-    /// it must NOT be dyn-compatible (because of the `impl Trait` return type),
-    /// which is expected and correct for this pattern.
-    ///
-    /// The test below is a compile-time assertion: if `SelectArrowExt` were
-    /// accidentally made dyn-compatible the test body would need to change.
-    /// We assert the trait is usable as a generic bound (the extension-trait
-    /// use-case) rather than as a trait object.
+    use super::SelectArrowExt;
+
+    /// Verify that `SelectArrowExt` is usable as a generic bound (the extension-trait
+    /// use-case) even though no concrete types are available in this crate to instantiate.
     ///
     /// This mirrors Plan §6 Example 1: `use sea_orm_arrow::SelectArrowExt;`
     /// makes `stream_arrow` available on any implementing type.
     #[test]
     fn extension_trait_is_bound_usable() {
-        use super::SelectArrowExt;
-
         // Generic function that accepts anything implementing SelectArrowExt —
-        // this is the primary consumer pattern.  If the trait definition is
-        // broken (e.g. missing a required super-trait) this function would fail
-        // to compile, catching regressions at CI time.
-        fn _assert_bound<T: SelectArrowExt>(_query: T) {}
+        // this is the primary consumer pattern. If the trait definition is
+        // broken (e.g. missing a required super-trait or associated type) this
+        // function fails to compile, catching regressions at CI time.
+        fn _assert_bound<T>(_query: T)
+        where
+            T: SelectArrowExt,
+        {
+        }
 
         // The function is never called at runtime — the compile-time check is
-        // the point.  We mark it with `#[allow(dead_code)]` to keep clippy happy.
+        // the point.
         #[allow(dead_code)]
         fn _unused() {
             // Would be called like: _assert_bound(User::find())
@@ -182,22 +189,50 @@ mod tests {
         }
     }
 
+    /// Verify the associated-type shape is correct: `Db` is `?Sized` (allowing
+    /// `&dyn Trait` connection types), `Error` is unconstrained (permitting both
+    /// `sea_orm::DbErr` and custom error types).
+    #[test]
+    fn associated_types_are_flexible() {
+        use arrow::record_batch::RecordBatch;
+        use futures::Stream;
+
+        // Concrete test impl with a unit Db and infallible error to confirm
+        // the trait can be implemented with any Db / Error pair.
+        struct MockQuery;
+        struct MockDb;
+
+        impl SelectArrowExt for MockQuery {
+            type Db = MockDb;
+            type Error = std::convert::Infallible;
+
+            fn stream_arrow(
+                self,
+                _db: &Self::Db,
+            ) -> impl Stream<Item = Result<RecordBatch, Self::Error>> + Send {
+                futures::stream::empty()
+            }
+        }
+
+        let _q = MockQuery;
+        // Confirm the impl satisfies the bound.
+        fn require_ext<T: SelectArrowExt>(_: T) {}
+        require_ext(MockQuery);
+    }
+
     /// Doc-test style: demonstrate the import idiom from Plan §6 Example 1.
     ///
     /// ```rust,ignore
     /// use sea_orm_arrow::SelectArrowExt;   // <-- the only required import
     ///
-    /// // Now stream_arrow is available on any Select<E> or SelectorRaw<S>:
+    /// // Now stream_arrow is available on any Select<E> or SelectorRaw<S>
+    /// // (once the blanket impls land in sea-orm's `with-arrow` module):
     /// let stream = User::find().stream_arrow(&db);
     /// ```
     #[test]
     fn import_idiom_documented() {
         // Verify the trait is re-exported at the crate root level (done by
-        // orchestrator's `pub mod stream;` + consumers do
-        // `use sea_orm_arrow::stream::SelectArrowExt` or
-        // `use sea_orm_arrow::SelectArrowExt` once orchestrator adds the
-        // `pub use stream::SelectArrowExt;` re-export).
-        //
+        // the `pub use stream::SelectArrowExt;` re-export in lib.rs).
         // This is a no-op test whose presence signals to reviewers that the
         // import contract is intentional.
         let _ = stringify!(use sea_orm_arrow::SelectArrowExt);

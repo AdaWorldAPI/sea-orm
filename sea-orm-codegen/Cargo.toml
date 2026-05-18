@@ -40,6 +40,8 @@ syn = { version = "2", default-features = false, features = [
     "fold",
 ] }
 tracing = { version = "0.1", default-features = false, features = ["log"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 
 [dev-dependencies]
 indoc             = "2.0.6"
