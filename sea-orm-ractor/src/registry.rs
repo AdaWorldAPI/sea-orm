@@ -101,16 +101,23 @@ where
     /// Body is stubbed with `unimplemented!` because async spawn integration (tokio
     /// handle + ractor supervisor wiring) is deferred to Sprint 2.
     pub fn get_or_spawn(&self, pk: <E as EntityActor>::ActorPrimaryKey) -> ActorRef<<E as EntityActor>::ActorMsg> {
-        // Fast path: actor already registered.
-        {
-            let map = self.map.read().expect("EntityActorRegistry RwLock poisoned");
-            if let Some(actor_ref) = map.get(&pk) {
-                return actor_ref.clone();
-            }
-        }
-
-        // Slow path: need to spawn.  We do NOT hold the read lock while spawning so
-        // that concurrent `get_or_spawn` calls on different PKs are not serialised.
+        // PP-13 AP1 fix (wave-3): every call panics until Sprint 2 lands the
+        // ractor::Actor::spawn wiring. The previous version had a fast-path
+        // read-cache check that silently returned cloned ActorRefs when a PK
+        // was already registered — but since nothing ever inserts into the
+        // map (the slow path stays unimplemented!()), the function had two
+        // observable behaviours: silent cached hit (impossible in practice
+        // but consumer-visible in tests that pre-populate the map) vs.
+        // panic. That mismatch is AP1 (stub returning a non-panic default).
+        // Sprint 2 restores the cache check + adds the real spawn body:
+        //
+        //     let map = self.map.read().expect("...");
+        //     if let Some(actor_ref) = map.get(&pk) { return actor_ref.clone(); }
+        //     drop(map);
+        //     let actor_ref = (self.spawn_fn)(pk.clone()).await;  // Sprint 2
+        //     self.map.write().expect("...").insert(pk, actor_ref.clone());
+        //     actor_ref
+        let _ = pk; // silence unused-arg warning until Sprint 2
         unimplemented!("SO-1 stub — Sprint 1: async ractor::Actor::spawn wiring pending")
     }
 
