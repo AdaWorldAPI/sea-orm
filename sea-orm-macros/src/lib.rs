@@ -1318,6 +1318,92 @@ pub fn derive_arrow_schema(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Attach a `ractor` actor registry to a SeaORM entity.
+///
+/// # Overview
+///
+/// Placed on the `Model` struct inside a SeaORM entity module, this derive macro
+/// implements [`sea_orm_ractor::entity_actor::EntityActor`] for the sibling `Entity`
+/// type (emitted as bare `Entity` in the same module scope) and wires up a process-local
+/// [`sea_orm_ractor::registry::EntityActorRegistry`] static.  Consumers can then
+/// resolve or spawn the actor for any primary-key value by calling
+/// `Entity::actor(pk)`.
+///
+/// # Attribute
+///
+/// ```rust,ignore
+/// #[actor(msg = "YourMsgType")]
+/// ```
+///
+/// The `msg` key names the message enum the actor accepts.  It must implement
+/// `ractor::Message` (i.e. `Send + 'static`).  The attribute is **required**; omitting
+/// it is a compile error.
+///
+/// # Supported primary-key types
+///
+/// Any single-column primary key type works: `i32`, `i64`, `u32`, `u64`, `String`, etc.
+/// Composite (multi-column) primary keys are **not yet supported** and produce a
+/// `compile_error!` with a Sprint 2 reminder.
+///
+/// # Generated code shape (plan §5)
+///
+/// ```rust,ignore
+/// impl ::sea_orm_ractor::entity_actor::EntityActor for Entity {
+///     type ActorMsg        = YourMsgType;
+///     type ActorPrimaryKey = i64;   // inferred from the primary_key field
+///
+///     fn actor(pk: i64) -> ::ractor::ActorRef<YourMsgType> {
+///         REGISTRY.get_or_spawn(pk)
+///     }
+/// }
+///
+/// static REGISTRY: ::std::sync::LazyLock<
+///     ::sea_orm_ractor::registry::EntityActorRegistry<Entity>
+/// > = ::std::sync::LazyLock::new(|| {
+///     ::sea_orm_ractor::registry::EntityActorRegistry::new(|_pk| {
+///         unimplemented!("SeaOrmActor derive: spawn closure — Sprint 2")
+///     })
+/// });
+/// ```
+///
+/// # Consumer example (plan §5 "wow moment")
+///
+/// ```rust,ignore
+/// use sea_orm::entity::prelude::*;
+///
+/// mod ticket {
+///     use sea_orm::entity::prelude::*;
+///
+///     #[sea_orm::model]
+///     #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SeaOrmActor)]
+///     #[sea_orm(table_name = "ticket")]
+///     #[actor(msg = "TicketMsg")]
+///     pub struct Model {
+///         #[sea_orm(primary_key)]
+///         pub id: i64,
+///         pub status: String,
+///     }
+///
+///     #[derive(Debug)]
+///     pub enum TicketMsg { Assign(i64), Resolve, Escalate }
+///
+///     impl ActiveModelBehavior for ActiveModel {}
+/// }
+///
+/// ticket::Entity::actor(4711_i64)
+///     .send_message(ticket::TicketMsg::Escalate)?;
+/// ```
+///
+/// *integration-plan §5 reference*: Glue #3 — `sea-orm-ractor` derive macro.
+#[cfg(feature = "derive")]
+#[proc_macro_derive(SeaOrmActor, attributes(actor))]
+pub fn expand_derive_sea_orm_actor(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    derives::expand_derive_sea_orm_actor(input)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
 #[cfg(feature = "derive")]
 #[proc_macro_attribute]
 pub fn sea_orm_model(_attr: TokenStream, input: TokenStream) -> TokenStream {
