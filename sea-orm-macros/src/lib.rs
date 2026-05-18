@@ -1324,7 +1324,7 @@ pub fn derive_arrow_schema(input: TokenStream) -> TokenStream {
 ///
 /// Placed on the `Model` struct inside a SeaORM entity module, this derive macro
 /// implements [`sea_orm_ractor::entity_actor::EntityActor`] for the sibling `Entity`
-/// type (via `super::Entity`) and wires up a process-local
+/// type (emitted as bare `Entity` in the same module scope) and wires up a process-local
 /// [`sea_orm_ractor::registry::EntityActorRegistry`] static.  Consumers can then
 /// resolve or spawn the actor for any primary-key value by calling
 /// `Entity::actor(pk)`.
@@ -1348,7 +1348,7 @@ pub fn derive_arrow_schema(input: TokenStream) -> TokenStream {
 /// # Generated code shape (plan §5)
 ///
 /// ```rust,ignore
-/// impl ::sea_orm_ractor::entity_actor::EntityActor for super::Entity {
+/// impl ::sea_orm_ractor::entity_actor::EntityActor for Entity {
 ///     type ActorMsg        = YourMsgType;
 ///     type ActorPrimaryKey = i64;   // inferred from the primary_key field
 ///
@@ -1358,7 +1358,7 @@ pub fn derive_arrow_schema(input: TokenStream) -> TokenStream {
 /// }
 ///
 /// static REGISTRY: ::std::sync::LazyLock<
-///     ::sea_orm_ractor::registry::EntityActorRegistry<super::Entity>
+///     ::sea_orm_ractor::registry::EntityActorRegistry<Entity>
 /// > = ::std::sync::LazyLock::new(|| {
 ///     ::sea_orm_ractor::registry::EntityActorRegistry::new(|_pk| {
 ///         unimplemented!("SeaOrmActor derive: spawn closure — Sprint 2")
