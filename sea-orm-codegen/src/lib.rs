@@ -9,5 +9,3 @@ pub use merge::*;
 
 #[cfg(test)]
 mod tests_cfg;
-
-pub mod from_ontology;

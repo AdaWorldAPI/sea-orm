@@ -3,7 +3,6 @@ use std::fmt::Display;
 #[cfg(feature = "codegen")]
 pub mod generate;
 pub mod migrate;
-pub mod generate_from_ontology;
 
 #[cfg(feature = "codegen")]
 pub use generate::*;

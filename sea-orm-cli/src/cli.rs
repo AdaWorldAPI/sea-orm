@@ -2,7 +2,6 @@ use clap::{ArgAction, ArgGroup, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "codegen")]
 use dotenvy::dotenv;
 use std::ffi::OsStr;
-use std::path::PathBuf;
 
 #[cfg(feature = "codegen")]
 use crate::{handle_error, run_generate_command, run_migrate_command};
@@ -392,22 +391,6 @@ pub enum GenerateSubcommands {
             help = "Also generate a Mermaid ER diagram as `entities.mermaid` in the output directory"
         )]
         er_diagram: bool,
-    },
-    #[command(
-        name = "from-ontology",
-        about = "Generate entities from a lance-graph-catalog ontology YAML"
-    )]
-    FromOntology {
-        #[arg(long, help = "Path to the ontology YAML input file")]
-        yaml_path: PathBuf,
-
-        #[arg(
-            short = 'o',
-            long,
-            default_value = "./",
-            help = "Entity file output directory"
-        )]
-        output_dir: PathBuf,
     },
 }
 
