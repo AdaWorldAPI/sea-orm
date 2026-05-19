@@ -1,8 +1,5 @@
 pub use arrow;
 
-pub mod stream;
-pub use stream::SelectArrowExt;
-
 use arrow::array::*;
 use arrow::datatypes::i256;
 use sea_query::{ColumnType, Value};
