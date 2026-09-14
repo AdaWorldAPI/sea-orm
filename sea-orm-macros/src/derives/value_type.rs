@@ -1,6 +1,6 @@
 use super::attributes::value_type_attr;
 use super::value_type_match::{array_type_expr, can_try_from_u64, column_type_expr};
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{Field, Ident, Type, punctuated::Punctuated, spanned::Spanned, token::Comma};
 
@@ -16,6 +16,8 @@ struct DeriveValueTypeStruct {
     column_type: TokenStream,
     array_type: TokenStream,
     can_try_from_u64: bool,
+    /// Opt-in `#[sea_orm(try_getable_array)]`: also implement `TryGetableArray`.
+    try_getable_array: bool,
 }
 
 #[derive(Default)]
@@ -23,6 +25,7 @@ struct DeriveValueTypeStructAttrs {
     column_type: Option<TokenStream>,
     array_type: Option<TokenStream>,
     try_from_u64: bool,
+    try_getable_array: bool,
 }
 
 impl TryFrom<value_type_attr::SeaOrm> for DeriveValueTypeStructAttrs {
@@ -33,6 +36,7 @@ impl TryFrom<value_type_attr::SeaOrm> for DeriveValueTypeStructAttrs {
             column_type: attrs.column_type.map(|s| s.parse()).transpose()?,
             array_type: attrs.array_type.map(|s| s.parse()).transpose()?,
             try_from_u64: attrs.try_from_u64.is_some(),
+            try_getable_array: attrs.try_getable_array.is_some(),
         })
     }
 }
@@ -159,6 +163,7 @@ impl DeriveValueTypeStruct {
             column_type,
             array_type,
             can_try_from_u64,
+            try_getable_array: attrs.try_getable_array,
         })
     }
 
@@ -190,6 +195,23 @@ impl DeriveValueTypeStruct {
             quote!(
                 #[automatically_derived]
                 impl sea_orm::sea_query::postgres_array::NotU8 for #name {}
+            )
+        } else {
+            quote!()
+        };
+
+        let impl_try_getable_array = if cfg!(feature = "postgres-array") && self.try_getable_array {
+            quote!(
+                #[automatically_derived]
+                impl sea_orm::TryGetableArray for #name {
+                    fn try_get_by<I: sea_orm::ColIdx>(res: &sea_orm::QueryResult, index: I)
+                        -> std::result::Result<Vec<Self>, sea_orm::TryGetError> {
+                        Ok(<Vec<#field_type> as sea_orm::TryGetable>::try_get_by(res, index)?
+                            .into_iter()
+                            .map(#name)
+                            .collect())
+                    }
+                }
             )
         } else {
             quote!()
@@ -247,6 +269,8 @@ impl DeriveValueTypeStruct {
             #try_from_u64_impl
 
             #impl_not_u8
+
+            #impl_try_getable_array
         )
     }
 }
@@ -275,6 +299,12 @@ impl DeriveValueTypeString {
             Some(column_type) => column_type,
             None => &quote!(String(sea_orm::sea_query::StringLen::None)),
         };
+        let source = Ident::new("source", Span::mixed_site());
+        let res = Ident::new("res", Span::mixed_site());
+        let idx = Ident::new("idx", Span::mixed_site());
+        let string = Ident::new("string", Span::mixed_site());
+        let err = Ident::new("err", Span::mixed_site());
+        let value = Ident::new("v", Span::mixed_site());
 
         let impl_not_u8 = if cfg!(feature = "postgres-array") {
             quote!(
@@ -288,21 +318,21 @@ impl DeriveValueTypeString {
         quote!(
             #[automatically_derived]
             impl std::convert::From<#name> for sea_orm::Value {
-                fn from(source: #name) -> Self {
-                    #to_str(&source).into()
+                fn from(#source: #name) -> Self {
+                    #to_str(&#source).into()
                 }
             }
 
             #[automatically_derived]
             impl sea_orm::TryGetable for #name {
-                fn try_get_by<I: sea_orm::ColIdx>(res: &sea_orm::QueryResult, idx: I)
+                fn try_get_by<I: sea_orm::ColIdx>(#res: &sea_orm::QueryResult, #idx: I)
                     -> std::result::Result<Self, sea_orm::TryGetError> {
-                    let string = String::try_get_by(res, idx)?;
-                    #from_str(&string).map_err(|err| {
+                    let #string = String::try_get_by(#res, #idx)?;
+                    #from_str(&#string).map_err(|#err| {
                         sea_orm::TryGetError::DbErr(sea_orm::DbErr::TryIntoErr {
                             from: "String",
                             into: stringify!(#name),
-                            source: std::sync::Arc::new(err),
+                            source: std::sync::Arc::new(#err),
                         })
                     })
                 }
@@ -310,9 +340,9 @@ impl DeriveValueTypeString {
 
             #[automatically_derived]
             impl sea_orm::sea_query::ValueType for #name {
-                fn try_from(v: sea_orm::Value) -> std::result::Result<Self, sea_orm::sea_query::ValueTypeErr> {
-                    let string = <String as sea_orm::sea_query::ValueType>::try_from(v)?;
-                    #from_str(&string).map_err(|_| sea_orm::sea_query::ValueTypeErr)
+                fn try_from(#value: sea_orm::Value) -> std::result::Result<Self, sea_orm::sea_query::ValueTypeErr> {
+                    let #string = <String as sea_orm::sea_query::ValueType>::try_from(#value)?;
+                    #from_str(&#string).map_err(|_| sea_orm::sea_query::ValueTypeErr)
                 }
 
                 fn type_name() -> std::string::String {

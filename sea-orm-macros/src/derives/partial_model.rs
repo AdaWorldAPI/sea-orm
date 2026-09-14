@@ -1,8 +1,10 @@
+use std::collections::{HashMap, hash_map::Entry};
+
 use heck::ToUpperCamelCase;
 use proc_macro2::{Span, TokenStream};
-use quote::{format_ident, quote, quote_spanned};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
 use syn::{
-    Expr, Meta, Type, ext::IdentExt, punctuated::Punctuated, spanned::Spanned, token::Comma,
+    Expr, Ident, Meta, Type, ext::IdentExt, punctuated::Punctuated, spanned::Spanned, token::Comma,
 };
 
 use super::from_query_result::{
@@ -37,6 +39,7 @@ enum ColumnAs {
         typ: Type,
         field: syn::Ident,
         alias: Option<String>,
+        prefix: Option<String>,
     },
     Skip(syn::Ident),
 }
@@ -105,6 +108,7 @@ impl DerivePartialModel {
         }
 
         let mut column_as_list = Vec::with_capacity(fields.len());
+        let mut seen_nested: HashMap<(syn::Type, Option<String>), TokenStream> = HashMap::new();
 
         for field in fields {
             let field_span = field.span();
@@ -113,6 +117,7 @@ impl DerivePartialModel {
             let mut from_expr = None;
             let mut nested = false;
             let mut nested_alias = None;
+            let mut nested_prefix = None;
             let mut skip = false;
 
             for attr in field.attrs.iter() {
@@ -127,6 +132,19 @@ impl DerivePartialModel {
                             skip = true;
                         } else if meta.exists("nested") {
                             nested = true;
+                        } else if let Some(list) = meta.get_list_args("nested") {
+                            nested = true;
+                            for m in list.iter() {
+                                match m.get_as_kv("prefix") {
+                                    Some(p) => nested_prefix = (!p.is_empty()).then_some(p),
+                                    None => {
+                                        return Err(Error::Syn(syn::Error::new_spanned(
+                                            m,
+                                            "invalid nested attribute, expected `prefix = \"...\"`",
+                                        )));
+                                    }
+                                }
+                            }
                         } else if let Some(s) = meta.get_as_kv("from_col") {
                             from_col = Some(format_ident!("{}", s.to_upper_camel_case()));
                         } else if let Some(s) = meta.get_as_kv("from_expr") {
@@ -138,6 +156,7 @@ impl DerivePartialModel {
                 }
             }
 
+            let field_tokens = field.to_token_stream();
             let field_name = field.ident.unwrap();
 
             let col_as = match (from_col, from_expr, nested) {
@@ -155,11 +174,31 @@ impl DerivePartialModel {
                     expr,
                     field: field_name,
                 },
-                (None, None, true) => ColumnAs::Nested {
-                    typ: field.ty,
-                    field: field_name,
-                    alias: nested_alias,
-                },
+                (None, None, true) => {
+                    if let Some(prefix) = &nested_prefix {
+                        let key = (field.ty.clone(), Some(prefix.clone()));
+                        match seen_nested.entry(key) {
+                            Entry::Occupied(e) => {
+                                let msg = format!(
+                                    "multiple nested fields with the same type share prefix \"{prefix}\""
+                                );
+                                let mut err = syn::Error::new_spanned(&field_tokens, msg);
+                                err.combine(syn::Error::new_spanned(e.get(), "first defined here"));
+                                return Err(Error::Syn(err));
+                            }
+                            Entry::Vacant(e) => {
+                                e.insert(field_tokens);
+                            }
+                        }
+                    }
+
+                    ColumnAs::Nested {
+                        typ: field.ty,
+                        field: field_name,
+                        alias: nested_alias,
+                        prefix: nested_prefix,
+                    }
+                }
                 (None, None, false) => {
                     if entity.is_none() {
                         return Err(Error::EntityNotSpecified);
@@ -201,7 +240,9 @@ impl DerivePartialModel {
                     .iter()
                     .map(|col_as| FromQueryResultItem {
                         typ: match col_as {
-                            ColumnAs::Nested { .. } => FqrItemType::Nested,
+                            ColumnAs::Nested { prefix, .. } => FqrItemType::Nested {
+                                prefix: prefix.clone(),
+                            },
                             ColumnAs::Skip(_) => FqrItemType::Skip,
                             _ => FqrItemType::Flat,
                         },
@@ -254,7 +295,15 @@ impl DerivePartialModel {
     }
 
     fn impl_partial_model(&self) -> TokenStream {
-        let select_ident = format_ident!("select");
+        let select = Ident::new("select", Span::mixed_site());
+        let pre = Ident::new("pre", Span::mixed_site());
+        let nested_alias = Ident::new("nested_alias", Span::mixed_site());
+        let col_alias = Ident::new("col_alias", Span::mixed_site());
+        let alias = Ident::new("alias", Span::mixed_site());
+        let col_expr = Ident::new("col_expr", Span::mixed_site());
+        let casted = Ident::new("casted", Span::mixed_site());
+        let prefix_binding = Ident::new("prefix", Span::mixed_site());
+        let column_alias = Ident::new("ident", Span::mixed_site());
         let DerivePartialModel {
             entity,
             model_alias,
@@ -282,26 +331,26 @@ impl DerivePartialModel {
 
                 let non_nested = match model_alias {
                     Some(model_alias) => quote! {
-                        let col_expr = sea_orm::sea_query::Expr::col((#model_alias, #column));
-                        let casted = sea_orm::ColumnTrait::select_as(&#column, col_expr);
-                        sea_orm::QuerySelect::column_as(#select_ident, casted, col_alias)
+                        let #col_expr = sea_orm::sea_query::Expr::col((#model_alias, #column));
+                        let #casted = sea_orm::ColumnTrait::select_as(&#column, #col_expr);
+                        sea_orm::QuerySelect::column_as(#select, #casted, #col_alias)
                     },
                     None => quote! {
-                        sea_orm::QuerySelect::column_as(#select_ident, #column, col_alias)
+                        sea_orm::QuerySelect::column_as(#select, #column, #col_alias)
                     },
                 };
 
                 quote! {
-                    let #select_ident = {
-                        let col_alias = pre.map_or(#field.to_string(), |pre| format!("{pre}{}", #field));
-                        if let Some(nested_alias) = nested_alias {
-                            let alias = sea_orm::sea_query::SeaRc::new(nested_alias);
-                            let col_expr = sea_orm::sea_query::Expr::col(
-                                (alias, #column)
+                    let #select = {
+                        let #col_alias = #pre.map_or(#field.to_string(), |#pre| format!("{}{}", #pre, #field));
+                        if let Some(#nested_alias) = #nested_alias {
+                            let #alias = sea_orm::sea_query::SeaRc::new(#nested_alias);
+                            let #col_expr = sea_orm::sea_query::Expr::col(
+                                (#alias, #column)
                             );
 
-                            let casted = sea_orm::ColumnTrait::select_as(&#column, col_expr);
-                            sea_orm::QuerySelect::column_as(#select_ident, casted, col_alias)
+                            let #casted = sea_orm::ColumnTrait::select_as(&#column, #col_expr);
+                            sea_orm::QuerySelect::column_as(#select, #casted, #col_alias)
                         } else {
                             #non_nested
                         }
@@ -311,31 +360,46 @@ impl DerivePartialModel {
 
             ColumnAs::Expr { expr, field } => {
                 let field = field.unraw().to_string();
-                quote!(let #select_ident =
-                    if let Some(prefix) = pre {
-                        let ident = format!("{prefix}{}", #field);
-                        sea_orm::QuerySelect::column_as(#select_ident, #expr, ident)
+                quote!(let #select =
+                    if let Some(#prefix_binding) = #pre {
+                        let #column_alias = format!("{}{}", #prefix_binding, #field);
+                        sea_orm::QuerySelect::column_as(#select, #expr, #column_alias)
                     } else {
-                        sea_orm::QuerySelect::column_as(#select_ident, #expr, #field)
+                        sea_orm::QuerySelect::column_as(#select, #expr, #field)
                     };
                 )
             }
-            ColumnAs::Nested { typ, field, alias } => {
-                let field = field.unraw().to_string();
+            ColumnAs::Nested {
+                typ,
+                field,
+                alias,
+                prefix,
+            } => {
+                let field_str = field.unraw().to_string();
                 let alias_ref: Option<&str> = alias.as_deref();
                 let alias_arg = match alias_ref {
                     Some(s) => quote! { Some(#s) },
                     None => quote! { None },
                 };
-                quote!(let #select_ident =
-                    <#typ as sea_orm::PartialModelTrait>::select_cols_nested(#select_ident,
-                        Some(&if let Some(prefix) = pre {
-                                format!("{prefix}{}_", #field)
-                            } else {
-                                format!("{}_", #field)
-                            }
-                        ),
-                        #alias_arg
+                let prefix_expr = match prefix {
+                    Some(p) => quote! {
+                        Some(&if let Some(#prefix_binding) = #pre {
+                            format!("{}{}", #prefix_binding, #p)
+                        } else {
+                            #p.to_string()
+                        })
+                    },
+                    None => quote! {
+                        Some(&if let Some(#prefix_binding) = #pre {
+                            format!("{}{}_", #prefix_binding, #field_str)
+                        } else {
+                            format!("{}_", #field_str)
+                        })
+                    },
+                };
+                quote!(let #select =
+                    <#typ as sea_orm::PartialModelTrait>::select_cols_nested(
+                        #select, #prefix_expr, #alias_arg
                     );
                 )
             }
@@ -345,9 +409,9 @@ impl DerivePartialModel {
         quote! {
             #[automatically_derived]
             impl sea_orm::PartialModelTrait for #ident {
-                fn select_cols_nested<S: sea_orm::QuerySelect>(#select_ident: S, pre: Option<&str>, nested_alias: Option<&'static str>) -> S {
+                fn select_cols_nested<S: sea_orm::QuerySelect>(#select: S, #pre: Option<&str>, #nested_alias: Option<&'static str>) -> S {
                     #(#select_col_code_gen)*
-                    #select_ident
+                    #select
                 }
             }
         }
@@ -455,6 +519,92 @@ mod test {
         );
         assert_eq!(middle.from_query_result, false);
 
+        Ok(())
+    }
+
+    const CODE_SNIPPET_3: &str = r#"
+        struct PartialModel {
+            #[sea_orm(nested(prefix = "mgr_"))]
+            manager: Person,
+            #[sea_orm(nested(prefix = "csh_"))]
+            cashier: Person,
+        }
+        "#;
+
+    #[test]
+    fn test_load_macro_input_3() -> StdResult<()> {
+        let input = parse_str::<DeriveInput>(CODE_SNIPPET_3)?;
+        let middle = DerivePartialModel::new(input).unwrap();
+        assert_eq!(middle.fields.len(), 2);
+        assert_eq!(
+            middle.fields[0],
+            ColumnAs::Nested {
+                typ: parse_str("Person").unwrap(),
+                field: format_ident!("manager"),
+                alias: None,
+                prefix: Some("mgr_".to_string()),
+            }
+        );
+        assert_eq!(
+            middle.fields[1],
+            ColumnAs::Nested {
+                typ: parse_str("Person").unwrap(),
+                field: format_ident!("cashier"),
+                alias: None,
+                prefix: Some("csh_".to_string()),
+            }
+        );
+        assert_eq!(middle.from_query_result, true);
+        Ok(())
+    }
+
+    const CODE_SNIPPET_4: &str = r#"
+        struct PartialModel {
+            #[sea_orm(nested(prefix = "x_"))]
+            manager: Person,
+            #[sea_orm(nested(prefix = "x_"))]
+            cashier: Person,
+        }
+        "#;
+
+    #[test]
+    fn test_duplicate_prefix_error() {
+        let input: DeriveInput = parse_str(CODE_SNIPPET_4).unwrap();
+        assert!(DerivePartialModel::new(input).is_err());
+    }
+
+    const CODE_SNIPPET_5: &str = r#"
+        struct PartialModel {
+            #[sea_orm(nested)]
+            manager: Person,
+            #[sea_orm(nested)]
+            cashier: Person,
+        }
+        "#;
+
+    #[test]
+    fn test_duplicate_nested_without_prefix_is_accepted() -> StdResult<()> {
+        let input = parse_str::<DeriveInput>(CODE_SNIPPET_5)?;
+        let middle = DerivePartialModel::new(input).unwrap();
+        assert_eq!(middle.fields.len(), 2);
+        assert_eq!(
+            middle.fields[0],
+            ColumnAs::Nested {
+                typ: parse_str("Person").unwrap(),
+                field: format_ident!("manager"),
+                alias: None,
+                prefix: None,
+            }
+        );
+        assert_eq!(
+            middle.fields[1],
+            ColumnAs::Nested {
+                typ: parse_str("Person").unwrap(),
+                field: format_ident!("cashier"),
+                alias: None,
+                prefix: None,
+            }
+        );
         Ok(())
     }
 }

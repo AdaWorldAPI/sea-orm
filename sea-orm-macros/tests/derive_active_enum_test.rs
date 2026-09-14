@@ -74,6 +74,13 @@ pub enum TestEnum3 {
     HelloWorld,
 }
 
+#[derive(Debug, EnumIter, DeriveActiveEnum, Eq, PartialEq)]
+#[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "error_variant")]
+enum ErrorVariantEnum {
+    #[sea_orm(string_value = "error")]
+    Error,
+}
+
 #[test]
 fn derive_active_enum_value() {
     assert_eq!(TestEnum::DefaultVariant.to_value(), "defaultVariant");
@@ -94,6 +101,14 @@ fn derive_active_enum_value() {
     );
     assert_eq!(TestEnum::VariantPascalCase.to_value(), "VariantPascalCase");
     assert_eq!(TestEnum::CustomStringValue.to_value(), "CuStOmStRiNgVaLuE");
+}
+
+#[test]
+fn derive_active_enum_with_error_variant() {
+    assert_eq!(
+        <ErrorVariantEnum as TryFrom<&str>>::try_from("error"),
+        Ok(ErrorVariantEnum::Error)
+    );
 }
 
 #[test]
@@ -146,6 +161,11 @@ fn derive_active_enum_from_value() {
         TestEnum::try_from_value(&"CuStOmStRiNgVaLuE".to_string()),
         Ok(TestEnum::CustomStringValue)
     );
+    assert_eq!(
+        <TestEnum as TryFrom<&str>>::try_from("defaultVariant"),
+        Ok(TestEnum::DefaultVariant)
+    );
+    assert!(<TestEnum as TryFrom<&str>>::try_from("other").is_err());
 }
 
 #[test]
@@ -186,6 +206,11 @@ fn derive_database_enum_rs_type_enum() {
         <TestEnumWithEnumValue as ActiveEnum>::try_from_value(&value),
         Ok(TestEnumWithEnumValue::DefaultVariant)
     );
+    assert_eq!(
+        <TestEnumWithEnumValue as TryFrom<&str>>::try_from("defaultVariant"),
+        Ok(TestEnumWithEnumValue::DefaultVariant)
+    );
+    assert!(<TestEnumWithEnumValue as TryFrom<&str>>::try_from("other").is_err());
     let value: Value = value.into();
     assert_eq!(
         value,

@@ -83,25 +83,32 @@ pub(crate) mod macros {
 
 use macros::*;
 
-/// API for working with a `Column`. Mostly a wrapper of the identically named methods in [`sea_query::Expr`]
+/// Operations and comparisons available on every entity column.
+///
+/// Implemented by the generated `Column` enum for each entity, this is what
+/// turns `entity::COLUMN.field.eq(42)` into a filter expression. Most methods
+/// (`eq`, `lt`, `like`, `is_in`, …) mirror their counterparts on
+/// [`sea_query::Expr`] but qualify the column with its table automatically.
 pub trait ColumnTrait: IdenStatic + Iterable + FromStr {
-    #[allow(missing_docs)]
+    /// The entity this column belongs to.
     type EntityName: EntityName;
 
-    /// Get the column definition with SQL attributes
+    /// SQL type and constraints attached to this column.
     fn def(&self) -> ColumnDef;
 
-    /// Get the enum type name if this is a enum column
+    /// If the column maps to a database `ENUM`, the enum's type name.
+    /// Returns `None` for non-enum columns.
     fn enum_type_name(&self) -> Option<&'static str> {
         None
     }
 
-    /// Get the name of the entity the column belongs to
+    /// Table iden of the entity this column belongs to.
     fn entity_name(&self) -> DynIden {
         SeaRc::new(Self::EntityName::default())
     }
 
-    /// Get the table.column reference
+    /// Fully-qualified `(table, column)` reference, used when building
+    /// expressions that need to disambiguate columns across joined tables.
     fn as_column_ref(&self) -> (DynIden, DynIden) {
         (self.entity_name(), SeaRc::new(*self))
     }
@@ -488,12 +495,14 @@ pub trait ColumnTrait: IdenStatic + Iterable + FromStr {
     bind_array_oper!(array_contained, Contained);
     bind_array_oper!(array_overlap, Overlap);
 
-    /// Construct a [`Expr::Column`] wrapped in [`Expr`].
+    /// Wrap the column in a plain [`Expr`], suitable for use anywhere a
+    /// `sea_query` expression is expected.
     fn into_expr(self) -> Expr {
         self.into_simple_expr()
     }
 
-    /// Construct a returning [`Expr`].
+    /// Wrap the column as the expression used inside a `RETURNING` clause
+    /// for the given backend.
     #[allow(clippy::match_single_binding)]
     fn into_returning_expr(self, db_backend: DbBackend) -> Expr {
         match db_backend {
@@ -501,41 +510,43 @@ pub trait ColumnTrait: IdenStatic + Iterable + FromStr {
         }
     }
 
-    /// Cast column expression used in select statement.
-    /// It only cast database enum as text if it's an enum column.
+    /// Apply the standard SELECT-side cast for this column. By default,
+    /// enum columns are cast to text; non-enum columns are returned as-is.
     fn select_as(&self, expr: Expr) -> Expr {
         self.select_enum_as(expr)
     }
 
-    /// Cast enum column as text; do nothing if `self` is not an enum.
+    /// Cast an enum column to text; no-op for non-enum columns.
     fn select_enum_as(&self, expr: Expr) -> Expr {
         cast_enum_as(expr, &self.def(), select_enum_as)
     }
 
-    /// Cast value of a column into the correct type for database storage.
-    /// By default, it only cast text as enum type if it's an enum column.
+    /// Apply the standard write-side cast: convert text into the database's
+    /// enum type for enum columns, return as-is otherwise.
     fn save_as(&self, val: Expr) -> Expr {
         self.save_enum_as(val)
     }
 
-    /// Cast value of an enum column as enum type; do nothing if `self` is not an enum.
+    /// Cast a value into the column's enum type; no-op for non-enum columns.
     fn save_enum_as(&self, val: Expr) -> Expr {
         cast_enum_as(val, &self.def(), save_enum_as)
     }
 
-    /// Get the JSON key for deserialization.
+    /// JSON key used for this column when (de)serializing the model.
     #[cfg(feature = "with-json")]
     fn json_key(&self) -> &'static str {
         self.as_str()
     }
 }
 
-/// SeaORM's utility methods that act on [ColumnType]
+/// Extension methods on [`ColumnType`] for building [`ColumnDef`]s and
+/// inspecting database `ENUM` metadata.
 pub trait ColumnTypeTrait {
-    /// Instantiate a new [ColumnDef]
+    /// Wrap this [`ColumnType`] in a fresh [`ColumnDef`].
     fn def(self) -> ColumnDef;
 
-    /// Get the name of the enum if this is a enum column
+    /// Name of the database `ENUM` type if this column is an enum,
+    /// `None` otherwise.
     fn get_enum_name(&self) -> Option<&DynIden>;
 }
 
@@ -725,10 +736,9 @@ mod tests {
         );
     }
 
-    #[test]
     #[cfg(feature = "macros")]
-    fn select_as_1() {
-        use crate::{ActiveModelTrait, ActiveValue, Update};
+    mod select_as {
+        use super::*;
 
         mod hello_expanded {
             use crate as sea_orm;
@@ -825,37 +835,65 @@ mod tests {
             impl ActiveModelBehavior for ActiveModel {}
         }
 
-        fn assert_it<E, A>(active_model: A)
-        where
-            E: EntityTrait,
-            A: ActiveModelTrait<Entity = E>,
-        {
-            assert_eq!(
-                E::find().build(DbBackend::Postgres).to_string(),
-                r#"SELECT "hello"."id", "hello"."one1", CAST("hello"."two" AS integer), "hello"."three3" FROM "hello""#,
-            );
-            assert_eq!(
-                Update::one(active_model)
-                    .validate()
-                    .unwrap()
-                    .build(DbBackend::Postgres)
-                    .to_string(),
-                r#"UPDATE "hello" SET "one1" = 1, "two" = 2, "three3" = 3 WHERE "hello"."id" = 1"#,
-            );
+        #[test]
+        fn select_as_1() {
+            use crate::{ActiveModelTrait, ActiveValue, Update};
+
+            fn assert_it<E, A>(active_model: A)
+            where
+                E: EntityTrait,
+                A: ActiveModelTrait<Entity = E>,
+            {
+                assert_eq!(
+                    E::find().build(DbBackend::Postgres).to_string(),
+                    r#"SELECT "hello"."id", "hello"."one1", CAST("hello"."two" AS integer) AS "two", "hello"."three3" FROM "hello""#,
+                );
+                assert_eq!(
+                    Update::one(active_model)
+                        .validate()
+                        .unwrap()
+                        .build(DbBackend::Postgres)
+                        .to_string(),
+                    r#"UPDATE "hello" SET "one1" = 1, "two" = 2, "three3" = 3 WHERE "hello"."id" = 1"#,
+                );
+            }
+
+            assert_it(hello_expanded::ActiveModel {
+                id: ActiveValue::set(1),
+                one: ActiveValue::set(1),
+                two: ActiveValue::set(2),
+                three: ActiveValue::set(3),
+            });
+            assert_it(hello_compact::ActiveModel {
+                id: ActiveValue::set(1),
+                one: ActiveValue::set(1),
+                two: ActiveValue::set(2),
+                three: ActiveValue::set(3),
+            });
         }
 
-        assert_it(hello_expanded::ActiveModel {
-            id: ActiveValue::set(1),
-            one: ActiveValue::set(1),
-            two: ActiveValue::set(2),
-            three: ActiveValue::set(3),
-        });
-        assert_it(hello_compact::ActiveModel {
-            id: ActiveValue::set(1),
-            one: ActiveValue::set(1),
-            two: ActiveValue::set(2),
-            three: ActiveValue::set(3),
-        });
+        #[test]
+        fn select_as_columns_keep_aliases_in_multi_selects() {
+            use crate::{Iterable, QuerySelect};
+
+            fn assert_it<E: EntityTrait>() {
+                for select in [
+                    E::find(),
+                    E::find().select_only().columns(E::Column::iter()),
+                ] {
+                    assert_eq!(
+                        select
+                            .select_also(E::default())
+                            .build(DbBackend::Postgres)
+                            .to_string(),
+                        r#"SELECT "hello"."id" AS "A_id", "hello"."one1" AS "A_one1", CAST("hello"."two" AS integer) AS "A_two", "hello"."three3" AS "A_three3", "hello"."id" AS "B_id", "hello"."one1" AS "B_one1", CAST("hello"."two" AS integer) AS "B_two", "hello"."three3" AS "B_three3" FROM "hello""#,
+                    );
+                }
+            }
+
+            assert_it::<hello_expanded::Entity>();
+            assert_it::<hello_compact::Entity>();
+        }
     }
 
     #[test]
@@ -1105,7 +1143,7 @@ mod tests {
         {
             assert_eq!(
                 E::find().build(DbBackend::Postgres).to_string(),
-                r#"SELECT "hello"."id", "hello"."one1", CAST("hello"."two" AS integer), "hello"."three3" FROM "hello""#,
+                r#"SELECT "hello"."id", "hello"."one1", CAST("hello"."two" AS integer) AS "two", "hello"."three3" FROM "hello""#,
             );
             assert_eq!(
                 Update::one(active_model)

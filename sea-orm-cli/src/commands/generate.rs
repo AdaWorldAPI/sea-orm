@@ -9,6 +9,110 @@ use std::{error::Error, fs, path::Path, process::Command, str::FromStr};
 use tracing_subscriber::{EnvFilter, prelude::*};
 use url::Url;
 
+/// Split a string by comma while respecting parentheses nesting.
+/// This allows attributes like `test(a, b)` to be treated as a single value
+/// instead of being split into `test(a` and ` b)`.
+fn split_by_comma_ignoring_parentheses(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+
+    for c in s.chars() {
+        match c {
+            '(' => {
+                paren_depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                current.push(c);
+            }
+            '[' => {
+                bracket_depth += 1;
+                current.push(c);
+            }
+            ']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                current.push(c);
+            }
+            '{' => {
+                brace_depth += 1;
+                current.push(c);
+            }
+            '}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                current.push(c);
+            }
+            ',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    result.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    // Add the last segment
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        result.push(trimmed.to_string());
+    }
+
+    result
+}
+
+/// Process a vector of strings that may contain comma-separated values with nested parentheses.
+/// This handles the case where clap no longer splits by comma, so we need to manually split
+/// each string while respecting parentheses nesting.
+fn process_comma_separated_values(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .flat_map(|s| split_by_comma_ignoring_parentheses(&s))
+        .collect()
+}
+
+/// Whether a discovered SQLite column is a generated (computed) column.
+///
+/// Generated columns cannot be inserted or updated, so they are dropped from
+/// generated entities — emitting them as ordinary fields makes every
+/// `INSERT`/`UPDATE` fail with "cannot INSERT/UPDATE a generated column" (#3094).
+#[cfg(feature = "sqlx-sqlite")]
+fn sqlite_column_is_generated(col: &sea_schema::sqlite::def::ColumnInfo) -> bool {
+    use sea_schema::sqlite::def::ColumnVisibility;
+    matches!(
+        col.hidden,
+        ColumnVisibility::GeneratedVirtual | ColumnVisibility::GeneratedStored
+    )
+}
+
+#[cfg(feature = "sqlx-postgres")]
+fn remove_postgres_partial_unique_indexes(table: &mut sea_schema::postgres::def::TableDef) {
+    table
+        .unique_constraints
+        .retain(|constraint| !constraint.is_partial);
+}
+
+/// The database name carried by a connection URL, or `None` if it has none.
+///
+/// The usual shape is hierarchical — `protocol://user:pass@host:port/database_name`
+/// — where the name is the first path segment. PostgreSQL also accepts the
+/// shorthand `postgres:database_name`, which has no authority component; the URL
+/// crate treats that as a "cannot-be-a-base" URL and yields no path segments at
+/// all, so the whole path is the database name (#2647).
+fn database_name_from_url(url: &Url) -> Option<&str> {
+    match url.path_segments() {
+        Some(mut segments) => segments.next(),
+        None => Some(url.path()),
+    }
+    .filter(|name| !name.is_empty())
+}
+
 pub async fn run_generate_command(
     command: GenerateSubcommands,
     verbose: bool,
@@ -89,31 +193,15 @@ pub async fn run_generate_command(
             let filter_skip_tables = |table: &String| -> bool { !ignore_tables.contains(table) };
 
             let _database_name = if !is_sqlite {
-                // The database name should be the first element of the path string
-                //
                 // Throwing an error if there is no database name since it might be
                 // accepted by the database without it, while we're looking to dump
                 // information from a particular database
-                let database_name = url
-                    .path_segments()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "There is no database name as part of the url path: {}",
-                            url.as_str()
-                        )
-                    })
-                    .next()
-                    .unwrap();
-
-                // An empty string as the database name is also an error
-                if database_name.is_empty() {
+                database_name_from_url(&url).unwrap_or_else(|| {
                     panic!(
                         "There is no database name as part of the url path: {}",
                         url.as_str()
-                    );
-                }
-
-                database_name
+                    )
+                })
             } else {
                 Default::default()
             };
@@ -146,7 +234,11 @@ pub async fn run_generate_command(
                             .filter(|schema| filter_tables(&schema.info.name))
                             .filter(|schema| filter_hidden_tables(&schema.info.name))
                             .filter(|schema| filter_skip_tables(&schema.info.name))
-                            .map(|schema| schema.write())
+                            .map(|mut schema| {
+                                // Skip generated columns (see #3094).
+                                schema.columns.retain(|col| !col.extra.generated);
+                                schema.write()
+                            })
                             .collect();
                         (None, table_stmts)
                     }
@@ -181,7 +273,15 @@ pub async fn run_generate_command(
                             .filter(|schema| filter_tables(&schema.name))
                             .filter(|schema| filter_hidden_tables(&schema.name))
                             .filter(|schema| filter_skip_tables(&schema.name))
-                            .map(|schema| schema.write())
+                            .map(|mut schema| {
+                                // Skip generated columns: codegen can't round-trip them, and
+                                // emitting them as ordinary fields makes INSERT/UPDATE fail
+                                // ("cannot INSERT/UPDATE a generated column"). See #3094.
+                                schema
+                                    .columns
+                                    .retain(|col| !sqlite_column_is_generated(col));
+                                schema.write()
+                            })
                             .collect();
                         (None, table_stmts)
                     }
@@ -214,7 +314,13 @@ pub async fn run_generate_command(
                             .filter(|schema| filter_tables(&schema.info.name))
                             .filter(|schema| filter_hidden_tables(&schema.info.name))
                             .filter(|schema| filter_skip_tables(&schema.info.name))
-                            .map(|schema| schema.write())
+                            .map(|mut schema| {
+                                // Skip generated columns (see #3094).
+                                schema.columns.retain(|col| col.generated.is_none());
+                                // Remove them because we don't support partial unique indexes in codegen yet.
+                                remove_postgres_partial_unique_indexes(&mut schema);
+                                schema.write()
+                            })
                             .collect();
                         (database_schema, table_stmts)
                     }
@@ -222,6 +328,15 @@ pub async fn run_generate_command(
                 _ => unimplemented!("{} is not supported", url.scheme()),
             };
             println!("... discovered.");
+
+            // Process extra derives and attributes, splitting by comma while respecting parentheses
+            // This handles cases like `--model-extra-attributes 'cfg_attr(debug_assertions, derive(Debug))'`
+            // which should be treated as a single attribute, not split into `cfg_attr(debug_assertions` and ` derive(Debug))`
+            let model_extra_derives = process_comma_separated_values(model_extra_derives);
+            let model_extra_attributes = process_comma_separated_values(model_extra_attributes);
+            let enum_extra_derives = process_comma_separated_values(enum_extra_derives);
+            let enum_extra_attributes = process_comma_separated_values(enum_extra_attributes);
+            let column_extra_derives = process_comma_separated_values(column_extra_derives);
 
             let writer_context = EntityWriterContext::new(
                 if expanded_format {
@@ -346,7 +461,7 @@ where
         pool_options = pool_options.after_connect(move |conn, _| {
             let sql = sql.clone();
             Box::pin(async move {
-                sqlx::Executor::execute(conn, sql.as_str())
+                sqlx::Executor::execute(conn, sqlx::AssertSqlSafe(sql))
                     .await
                     .map(|_| ())
             })
@@ -390,6 +505,34 @@ mod tests {
 
     use super::*;
     use crate::{Cli, Commands};
+
+    #[test]
+    fn test_database_name_from_url() {
+        let cases = [
+            // Shorthand with no authority component -- the case from #2647.
+            ("postgres:my_db", Some("my_db")),
+            ("postgresql:my_db", Some("my_db")),
+            // The usual hierarchical forms.
+            ("postgres://user:pass@localhost:5432/my_db", Some("my_db")),
+            ("postgres:///my_db", Some("my_db")),
+            ("mysql://root:root@localhost:3306/my_db", Some("my_db")),
+            // Only the first segment is the database name.
+            ("postgres://localhost/my_db/extra", Some("my_db")),
+            // No database name in any form.
+            ("postgresql://root:root@localhost:3306", None),
+            ("mysql://root:root@localhost:3306/", None),
+            ("postgres:", None),
+        ];
+
+        for (input, expected) in cases {
+            let url = Url::parse(input).unwrap_or_else(|e| panic!("could not parse {input}: {e}"));
+            assert_eq!(
+                database_name_from_url(&url),
+                expected,
+                "unexpected database name for {input}"
+            );
+        }
+    }
 
     #[test]
     #[should_panic(
@@ -471,5 +614,277 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn test_split_by_comma_simple() {
+        // Simple comma-separated values should split normally
+        let result = super::split_by_comma_ignoring_parentheses("a,b,c");
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_split_by_comma_with_parentheses() {
+        // Comma inside parentheses should NOT split
+        let result = super::split_by_comma_ignoring_parentheses("test(a, b)");
+        assert_eq!(result, vec!["test(a, b)"]);
+
+        // Multiple values, one with parentheses containing comma
+        let result = super::split_by_comma_ignoring_parentheses("attr1,test(a, b)");
+        assert_eq!(result, vec!["attr1", "test(a, b)"]);
+    }
+
+    #[test]
+    fn test_split_by_comma_with_nested_parentheses() {
+        // Nested parentheses with commas
+        let result =
+            super::split_by_comma_ignoring_parentheses("cfg_attr(debug_assertions, derive(Debug))");
+        assert_eq!(result, vec!["cfg_attr(debug_assertions, derive(Debug))"]);
+
+        // Multiple nested parentheses
+        let result = super::split_by_comma_ignoring_parentheses(
+            "cfg_attr(feature1, attr(a, b)),cfg_attr(feature2, attr(c, d))",
+        );
+        assert_eq!(
+            result,
+            vec![
+                "cfg_attr(feature1, attr(a, b))",
+                "cfg_attr(feature2, attr(c, d))"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_by_comma_with_brackets() {
+        // Brackets should also be respected
+        let result = super::split_by_comma_ignoring_parentheses(
+            "serde(rename_all = \"camelCase\"),ts(export)",
+        );
+        assert_eq!(
+            result,
+            vec!["serde(rename_all = \"camelCase\")", "ts(export)"]
+        );
+
+        // Brackets with commas
+        let result = super::split_by_comma_ignoring_parentheses("attr[key, value],other");
+        assert_eq!(result, vec!["attr[key, value]", "other"]);
+    }
+
+    #[test]
+    fn test_split_by_comma_with_braces() {
+        // Braces should also be respected
+        let result = super::split_by_comma_ignoring_parentheses("derive{a, b},other");
+        assert_eq!(result, vec!["derive{a, b}", "other"]);
+    }
+
+    #[test]
+    fn test_split_by_comma_empty() {
+        // Empty string should return empty vec
+        let result = super::split_by_comma_ignoring_parentheses("");
+        assert!(result.is_empty());
+
+        // Only whitespace should return empty vec
+        let result = super::split_by_comma_ignoring_parentheses("   ");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_split_by_comma_whitespace_handling() {
+        // Whitespace around values should be trimmed
+        let result = super::split_by_comma_ignoring_parentheses("  a  ,  b  ");
+        assert_eq!(result, vec!["a", "b"]);
+
+        // Whitespace inside parentheses should be preserved
+        let result = super::split_by_comma_ignoring_parentheses("test( a , b )");
+        assert_eq!(result, vec!["test( a , b )"]);
+    }
+
+    #[test]
+    fn test_process_comma_separated_values() {
+        // Process multiple strings, each potentially containing comma-separated values
+        let input = vec![
+            "attr1,attr2".to_string(),
+            "test(a, b)".to_string(),
+            "attr3".to_string(),
+        ];
+        let result = super::process_comma_separated_values(input);
+        assert_eq!(result, vec!["attr1", "attr2", "test(a, b)", "attr3"]);
+    }
+
+    #[test]
+    fn test_split_by_comma_real_world_examples() {
+        // Real-world example: cfg_attr with derive
+        let result = super::split_by_comma_ignoring_parentheses(
+            "cfg_attr(debug_assertions, derive(Debug)),serde(rename_all = \"camelCase\")",
+        );
+        assert_eq!(
+            result,
+            vec![
+                "cfg_attr(debug_assertions, derive(Debug))",
+                "serde(rename_all = \"camelCase\")"
+            ]
+        );
+
+        // Real-world example: multiple derives
+        let result = super::split_by_comma_ignoring_parentheses(
+            "derive(Debug, Clone),derive(Serialize, Deserialize)",
+        );
+        assert_eq!(
+            result,
+            vec!["derive(Debug, Clone)", "derive(Serialize, Deserialize)"]
+        );
+    }
+
+    // Regression test for #3094: generated columns must be dropped during
+    // `generate entity`, otherwise they are emitted as ordinary writable fields
+    // and every INSERT/UPDATE fails ("cannot INSERT/UPDATE a generated column").
+    #[cfg(feature = "sqlx-sqlite")]
+    #[test]
+    fn test_generate_entity_skips_sqlite_generated_columns() {
+        use sea_schema::sea_query::ColumnType;
+        use sea_schema::sqlite::def::{ColumnInfo, ColumnVisibility, DefaultType, TableDef};
+
+        let col = |cid, name: &str, hidden| ColumnInfo {
+            cid,
+            name: name.to_owned(),
+            r#type: ColumnType::Integer,
+            not_null: true,
+            default_value: DefaultType::Unspecified,
+            primary_key: cid == 0,
+            hidden,
+        };
+
+        let mut table = TableDef {
+            name: "widget".to_owned(),
+            foreign_keys: vec![],
+            indexes: vec![],
+            constraints: vec![],
+            columns: vec![
+                col(0, "id", ColumnVisibility::Visible),
+                col(1, "w", ColumnVisibility::Visible),
+                col(2, "area", ColumnVisibility::GeneratedVirtual),
+                col(3, "area_stored", ColumnVisibility::GeneratedStored),
+            ],
+            auto_increment: false,
+        };
+
+        // The predicate flags only the generated columns.
+        assert!(!super::sqlite_column_is_generated(&table.columns[0]));
+        assert!(!super::sqlite_column_is_generated(&table.columns[1]));
+        assert!(super::sqlite_column_is_generated(&table.columns[2]));
+        assert!(super::sqlite_column_is_generated(&table.columns[3]));
+
+        // After filtering + write(), generated columns are absent from the DDL.
+        table
+            .columns
+            .retain(|col| !super::sqlite_column_is_generated(col));
+        let stmt = table.write();
+        let names: Vec<String> = stmt
+            .get_columns()
+            .iter()
+            .map(|c| c.get_column_name())
+            .collect();
+        assert_eq!(names, ["id", "w"]);
+    }
+
+    // Discovery-backed companion to the regression test above. The test above
+    // hand-builds `ColumnVisibility`, so it proves the filter but not that real
+    // `GENERATED ALWAYS AS (...)` DDL actually surfaces as `Generated*` from
+    // `PRAGMA table_xinfo`. This exercises the discovery -> filter contract end
+    // to end against an in-memory SQLite database, which is the whole premise of
+    // the #3094 fix.
+    #[cfg(all(feature = "sqlx-sqlite", feature = "tokio"))]
+    #[tokio::test]
+    async fn test_sqlite_discovery_reports_generated_columns() {
+        use sea_schema::sqlite::discovery::SchemaDiscovery;
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        // `sqlite::memory:` gives each connection its own private database, so
+        // pin the pool to a single connection or CREATE TABLE and discovery
+        // would run against different in-memory databases.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+
+        sqlx::query(
+            "CREATE TABLE widget ( \
+                 id INTEGER PRIMARY KEY, \
+                 w INTEGER NOT NULL, \
+                 h INTEGER NOT NULL, \
+                 area_virtual INTEGER GENERATED ALWAYS AS (w * h) VIRTUAL, \
+                 area_stored INTEGER GENERATED ALWAYS AS (w * h) STORED \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        let schema = SchemaDiscovery::new(pool)
+            .discover()
+            .await
+            .expect("discover schema");
+
+        let table = schema
+            .tables
+            .iter()
+            .find(|table| table.name == "widget")
+            .expect("widget table discovered");
+
+        // Real generated DDL is discovered as `Generated*` visibility — the
+        // fact the hand-built unit test has to assume.
+        let generated: Vec<&str> = table
+            .columns
+            .iter()
+            .filter(|col| super::sqlite_column_is_generated(col))
+            .map(|col| col.name.as_str())
+            .collect();
+        assert_eq!(generated, ["area_virtual", "area_stored"]);
+
+        // After the retain performed by `generate entity`, only the base
+        // (writable) columns survive.
+        let kept: Vec<&str> = table
+            .columns
+            .iter()
+            .filter(|col| !super::sqlite_column_is_generated(col))
+            .map(|col| col.name.as_str())
+            .collect();
+        assert_eq!(kept, ["id", "w", "h"]);
+    }
+
+    #[cfg(feature = "sqlx-postgres")]
+    #[test]
+    fn filter_out_postgres_partial_unique_indexes() {
+        use sea_schema::postgres::def::{TableDef, TableInfo, Unique};
+
+        let unique_constraint = Unique {
+            name: "login_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            is_partial: false,
+        };
+        let partial_constraint = Unique {
+            name: "login_human_login_id_key".to_owned(),
+            columns: vec!["human_login_id".to_owned()],
+            is_partial: true,
+        };
+        let mut table = TableDef {
+            info: TableInfo {
+                name: "login".to_owned(),
+                of_type: None,
+            },
+            columns: vec![],
+            check_constraints: vec![],
+            not_null_constraints: vec![],
+            unique_constraints: vec![unique_constraint.clone(), partial_constraint],
+            primary_key_constraints: vec![],
+            reference_constraints: vec![],
+            exclusion_constraints: vec![],
+        };
+
+        super::remove_postgres_partial_unique_indexes(&mut table);
+
+        assert_eq!(table.unique_constraints.len(), 1);
+        assert_eq!(table.unique_constraints[0], unique_constraint);
     }
 }
